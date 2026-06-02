@@ -16,6 +16,7 @@ class Post(models.Model):
     floor_size = models.CharField(max_length=50, blank=True)
     location = models.CharField(max_length=500, blank=True)
     property_type = models.CharField(max_length=200, blank=True)
+    raw_data = models.JSONField(default=dict, blank=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_DRAFT)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
