@@ -55,12 +55,21 @@ def _render_page(url: str) -> Optional[str]:
     Fetch page HTML for any URL.
     1. Try cloudscraper (fast, handles most Cloudflare JS challenges).
     2. Fall back to Playwright (headless Firefox) for JS-heavy or protected pages.
+    Returns None if the page is still blocked after all attempts.
     """
     html = _fetch_cloudscraper(url)
     if html and _has_enough_text(html):
         return html
+
     logger.info(f"cloudscraper insufficient, switching to Playwright: {url}")
-    return _fetch_playwright(url)
+    html = _fetch_playwright(url)
+
+    # If Playwright still returned a Cloudflare challenge page, return None
+    if html and not _has_enough_text(html):
+        logger.warning(f"Cloudflare Managed Challenge could not be bypassed: {url}")
+        return None
+
+    return html
 
 
 def _fetch_cloudscraper(url: str) -> Optional[str]:
@@ -117,8 +126,8 @@ def _fetch_playwright(url: str) -> Optional[str]:
                 page.goto(url, wait_until='load', timeout=30000)
             except Exception:
                 pass
-            # Allow up to 8s for Cloudflare challenge to auto-resolve
-            page.wait_for_timeout(8000)
+            # Allow up to 12s for Cloudflare challenge to auto-resolve
+            page.wait_for_timeout(12000)
             html = page.content()
             browser.close()
             return html
@@ -187,8 +196,13 @@ extract_property_data = extract_page_data
 
 def _parse_json_ld(soup: BeautifulSoup) -> Dict:
     """Return the most informative JSON-LD object on the page."""
-    LOW_PRIORITY = {'FAQPage', 'BreadcrumbList', 'WebPage', 'WebSite', 'Organization',
-                    'SearchResultsPage', 'ItemList', 'SiteLinksSearchBox'}
+    LOW_PRIORITY = {
+        'FAQPage', 'BreadcrumbList', 'WebPage', 'WebSite', 'Organization',
+        'SearchResultsPage', 'ItemList', 'SiteLinksSearchBox',
+        # Agent/business types — their 'name' is the company, not the listing
+        'RealEstateAgent', 'LocalBusiness', 'Corporation', 'EducationalOrganization',
+        'GovernmentOrganization', 'MedicalOrganization', 'NGO', 'SportsOrganization',
+    }
     best: Dict = {}
     for script in soup.find_all('script', type='application/ld+json'):
         try:
@@ -275,11 +289,15 @@ def _extract_description(soup: BeautifulSoup, ld: Dict, og: Dict) -> str:
 
 
 def _extract_location(soup: BeautifulSoup, ld: Dict, og: Dict, body_tx: str) -> str:
-    # JSON-LD address
+    # JSON-LD address (values may themselves be dicts, e.g. addressCountry: {"name": "Malaysia"})
     addr = ld.get('address') or ld.get('location', {})
     if isinstance(addr, dict):
-        parts = [addr.get('streetAddress', ''), addr.get('addressLocality', ''),
-                 addr.get('addressRegion', ''), addr.get('addressCountry', '')]
+        def _str(v: Any) -> str:
+            if isinstance(v, dict):
+                return v.get('name', '') or v.get('@id', '')
+            return str(v) if v else ''
+        parts = [_str(addr.get('streetAddress')), _str(addr.get('addressLocality')),
+                 _str(addr.get('addressRegion')), _str(addr.get('addressCountry'))]
         loc = ', '.join(p for p in parts if p)
         if loc:
             return loc
