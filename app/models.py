@@ -39,7 +39,6 @@ class ScraperPattern(models.Model):
     location_sel= models.CharField(max_length=500, blank=True)
     image_sel   = models.CharField(max_length=500, blank=True)
     confidence  = models.FloatField(default=0.0)   # 0.0 – 1.0
-    source      = models.CharField(max_length=20, default='auto')  # 'auto' | 'llm'
     scrape_count= models.IntegerField(default=0)
     updated_at  = models.DateTimeField(auto_now=True)
 
