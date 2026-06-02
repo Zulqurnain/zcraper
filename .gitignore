@@ -2,7 +2,11 @@ venv/
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 db.sqlite3
 media/
 *.csv
 .env
+.env.*
+*.log
+.DS_Store
