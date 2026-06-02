@@ -17,6 +17,8 @@ class Post(models.Model):
     location = models.CharField(max_length=500, blank=True)
     property_type = models.CharField(max_length=200, blank=True)
     raw_data = models.JSONField(default=dict, blank=True)
+    image_urls = models.JSONField(default=list, blank=True)       # remote URLs found
+    downloaded_images = models.JSONField(default=list, blank=True) # local paths after download
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_DRAFT)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

@@ -335,39 +335,74 @@ def _extract_category(soup: BeautifulSoup, ld: Dict, og: Dict) -> str:
     return og.get('og:type', '')
 
 
+_IMG_URL_RE = re.compile(
+    r'https?://[^\s"\'<>]+\.(?:jpg|jpeg|png|webp|gif)(?:\?[^\s"\'<>]*)?',
+    re.IGNORECASE,
+)
+_SKIP_PATTERNS = re.compile(
+    r'/icons?/|/logo|/avatar|/badge|/banner|/placeholder|/blank|/loading|'
+    r'/spinner|/pixel|/tracking|/static-assets|1x1|/emoji|\.svg'
+    r'|\$\{|\{[a-zA-Z]',  # JS template literals like ${viewType}
+    re.IGNORECASE,
+)
+
+
 def _extract_images(soup: BeautifulSoup, og: Dict, url: str) -> List[str]:
+    """
+    Collect image URLs from every possible source:
+      1. og:image / twitter:image
+      2. <img> tags (src, data-src, data-lazy-src, data-original, data-image)
+      3. CSS background-image inline styles
+      4. __NEXT_DATA__ / embedded JSON in <script> tags
+    """
     base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
     seen: Dict[str, None] = {}
 
-    # og:image first
-    if og.get('og:image'):
-        seen[og['og:image']] = None
-
-    # Twitter image
-    if og.get('twitter:image'):
-        seen[og['twitter:image']] = None
-
-    # All <img> tags — skip SVGs, data URIs, tracking pixels
-    for img in soup.find_all('img'):
-        src = (img.get('data-src') or img.get('data-lazy-src')
-               or img.get('data-original') or img.get('src', ''))
+    def _add(src: str):
         if not src or src.startswith('data:'):
-            continue
-        full = urljoin(base, src)
-        parsed = urlparse(full)
-        if parsed.scheme not in ('http', 'https'):
-            continue
-        # Skip tiny images (tracking pixels, icons often end in .gif or have w/h=1)
-        w = img.get('width', '0')
-        h = img.get('height', '0')
-        if str(w) == '1' or str(h) == '1':
-            continue
-        # Skip SVG and tiny icons
+            return
+        full = src if src.startswith('http') else urljoin(base, src)
+        if urlparse(full).scheme not in ('http', 'https'):
+            return
         if full.lower().endswith('.svg'):
-            continue
+            return
+        if _SKIP_PATTERNS.search(full):
+            return
         seen[full] = None
 
-    return list(seen.keys())[:20]
+    # 1. og:image / twitter:image
+    for key in ('og:image', 'twitter:image', 'og:image:url'):
+        if og.get(key):
+            _add(og[key])
+
+    # 2. <img> tags — every lazy-load attribute variant
+    for img in soup.find_all('img'):
+        for attr in ('data-src', 'data-lazy-src', 'data-original',
+                     'data-image', 'data-url', 'data-full', 'src'):
+            val = img.get(attr, '')
+            if val and not val.startswith('data:'):
+                _add(val)
+                break
+        w = img.get('width', '') or img.get('style', '')
+        h = img.get('height', '')
+        if str(w) == '1' or str(h) == '1':
+            seen.pop(list(seen.keys())[-1], None)  # remove last added tracking pixel
+
+    # 3. Inline background-image styles
+    for el in soup.find_all(style=True):
+        m = re.search(r'url\(["\']?(https?://[^"\')\s]+)["\']?\)', el['style'])
+        if m:
+            _add(m.group(1))
+
+    # 4. Script tags — __NEXT_DATA__, embedded JSON, and raw URL patterns
+    for script in soup.find_all('script'):
+        content = script.string or ''
+        if not content or len(content) > 500_000:
+            continue
+        for match in _IMG_URL_RE.finditer(content):
+            _add(match.group(0))
+
+    return list(seen.keys())[:50]  # up to 50 images
 
 
 def _extract_attributes(soup: BeautifulSoup, body_tx: str) -> Dict[str, str]:
@@ -433,21 +468,54 @@ def _extract_attributes(soup: BeautifulSoup, body_tx: str) -> Dict[str, str]:
 #  Image download                                                      #
 # ------------------------------------------------------------------ #
 
-def download_image(img_url: str, slug: str) -> Optional[str]:
-    """Download image to MEDIA_ROOT/images/<slug>/ and return relative path."""
+def download_image(img_url: str, slug: str, source_url: str = '') -> Optional[str]:
+    """
+    Download image to MEDIA_ROOT/images/<slug>/ and return the relative path.
+
+    Handles:
+    - Next.js /_next/image proxy URLs (extracts the real image URL from the `url=` param)
+    - Referer header set to the source site so CDN hotlink protection passes
+    """
     try:
+        # Unwrap Next.js image proxy: /_next/image?url=<encoded>&w=...&q=...
+        parsed = urlparse(img_url)
+        qs = dict(pair.split('=', 1) for pair in parsed.query.split('&') if '=' in pair)
+        if parsed.path.endswith('/_next/image') and 'url' in qs:
+            from urllib.parse import unquote
+            img_url = unquote(qs['url'])
+            parsed = urlparse(img_url)
+
         dest_dir = Path(settings.MEDIA_ROOT) / 'images' / slug
         dest_dir.mkdir(parents=True, exist_ok=True)
 
-        filename = os.path.basename(urlparse(img_url).path) or 'image.jpg'
+        # Build a clean filename from the URL path
+        path_part = parsed.path.rstrip('/')
+        filename = os.path.basename(path_part) or 'image.jpg'
+        # Strip query strings from filenames (e.g. image.jpg?v=2)
+        filename = filename.split('?')[0]
         filename = re.sub(r'[^\w.\-]', '_', filename)[:100]
+        if '.' not in filename:
+            filename += '.jpg'
         dest = dest_dir / filename
 
         if dest.exists():
             return str(dest.relative_to(settings.MEDIA_ROOT))
 
-        r = requests.get(img_url, headers=HEADERS, timeout=15, stream=True)
+        # Use site origin as Referer to bypass hotlink protection
+        referer = (
+            f"{urlparse(source_url).scheme}://{urlparse(source_url).netloc}"
+            if source_url else f"{parsed.scheme}://{parsed.netloc}"
+        )
+        headers = {**HEADERS, 'Referer': referer}
+
+        r = requests.get(img_url, headers=headers, timeout=20, stream=True)
         r.raise_for_status()
+
+        # Skip non-image responses (HTML error pages, etc.)
+        ct = r.headers.get('Content-Type', '')
+        if 'image' not in ct and 'octet-stream' not in ct:
+            return None
+
         with open(dest, 'wb') as f:
             for chunk in r.iter_content(chunk_size=8192):
                 f.write(chunk)
@@ -517,10 +585,25 @@ def scrape_and_create_draft(url: str):
         location=data['location'],
         property_type=property_type or data['category'],
         raw_data=data['attributes'],
+        image_urls=data['images'],
         status=Post.STATUS_DRAFT,
     )
 
-    return True, f"Draft created: '{post.title}' (id={post.pk})"
+    # Download images to disk
+    downloaded: List[str] = []
+    for img_url in data['images']:
+        path = download_image(img_url, slug, source_url=url)
+        if path:
+            downloaded.append(path)
+
+    if downloaded:
+        post.downloaded_images = downloaded
+        post.save(update_fields=['downloaded_images'])
+
+    return True, (
+        f"Draft created: '{post.title}' (id={post.pk}) — "
+        f"{len(data['images'])} images found, {len(downloaded)} downloaded"
+    )
 
 
 def _attr_value(attrs: Dict[str, str], keywords: List[str]) -> str:
