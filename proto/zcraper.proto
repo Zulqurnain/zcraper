@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package zcraper;
+
+message ZScrapeRequest {
+  string url = 1;
+}
+
+message ZScrapeResponse {
+  bool   success   = 1;
+  string message   = 2;
+  int64  post_id   = 3;
+  string draft_url = 4;
+}
+
+message ImageURL {
+  string url = 1;
+}
+
+service ZScraperService {
+  rpc Scrape (ZScrapeRequest) returns (ZScrapeResponse);
+  rpc StreamImageURLs (ZScrapeRequest) returns (stream ImageURL);
+}
