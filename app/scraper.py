@@ -233,17 +233,22 @@ def _extract_title(soup: BeautifulSoup, ld: Dict, og: Dict) -> str:
 
 
 def _extract_price(soup: BeautifulSoup, ld: Dict, og: Dict, body_tx: str) -> str:
-    # JSON-LD offer price
+    # JSON-LD offer price (skip zero/null values)
     offers = ld.get('offers', {})
     if isinstance(offers, list):
         offers = offers[0] if offers else {}
-    if isinstance(offers, dict) and offers.get('price'):
-        currency = offers.get('priceCurrency', '')
-        return f"{currency} {offers['price']}".strip()
+    if isinstance(offers, dict):
+        raw_price = offers.get('price')
+        try:
+            if raw_price is not None and float(str(raw_price).replace(',', '')) > 0:
+                currency = offers.get('priceCurrency', '')
+                return f"{currency} {raw_price}".strip()
+        except (ValueError, TypeError):
+            pass
 
-    # Generic currency pattern on visible text
+    # Generic currency pattern on visible text (collapse whitespace)
     m = _PRICE_RE.search(body_tx)
-    return m.group(0).strip() if m else ""
+    return re.sub(r'\s+', ' ', m.group(0)).strip() if m else ""
 
 
 def _extract_description(soup: BeautifulSoup, ld: Dict, og: Dict) -> str:
