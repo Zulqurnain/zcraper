@@ -153,13 +153,15 @@ def extract_page_data(html: str, url: str) -> Dict[str, Any]:
     Extract structured data from any web page.
 
     Priority cascade for each field:
-      JSON-LD structured data → OpenGraph/Twitter meta → visible HTML patterns
+      Cached PatternAI selectors → JSON-LD → OpenGraph/Twitter meta → visible HTML patterns
 
     Returns a dict with these keys (empty string / empty list when not found):
       title, price, description, location, category,
       images (list), attributes (dict of any key-value pairs on the page),
       source_url
     """
+    from app.pattern_ai import PatternAI
+    ai = PatternAI()
     soup = BeautifulSoup(html, 'lxml')
 
     ld      = _parse_json_ld(soup)
@@ -174,7 +176,7 @@ def extract_page_data(html: str, url: str) -> Dict[str, Any]:
     images      = _extract_images(soup, og, url)
     attributes  = _extract_attributes(soup, body_tx)
 
-    return {
+    data = {
         'title':       title,
         'price':       price,
         'description': description[:2000],
@@ -184,6 +186,11 @@ def extract_page_data(html: str, url: str) -> Dict[str, Any]:
         'attributes':  attributes,
         'source_url':  url,
     }
+
+    # PatternAI: fill any empty fields using cached domain selectors
+    data = ai.enhance(soup, url, data)
+
+    return data
 
 
 # kept for backward-compat (zscraper_service imports this name)
@@ -537,6 +544,9 @@ def scrape_and_create_draft(url: str):
     """
     from app.models import Post
 
+    from app.pattern_ai import PatternAI
+    ai = PatternAI()
+
     html = _render_page(url)
     if not html:
         return False, f"Failed to fetch page: {url}"
@@ -599,6 +609,10 @@ def scrape_and_create_draft(url: str):
     if downloaded:
         post.downloaded_images = downloaded
         post.save(update_fields=['downloaded_images'])
+
+    # PatternAI: learn selectors from this successful scrape
+    soup = BeautifulSoup(html, 'lxml')
+    ai.learn(url, soup, data)
 
     return True, (
         f"Draft created: '{post.title}' (id={post.pk}) — "
