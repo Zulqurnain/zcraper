@@ -4,7 +4,8 @@ WORKDIR /app
 COPY . .
 
 RUN pip install --no-cache-dir -r requirements.txt
-RUN python -m playwright install chromium --with-deps
+# Install Firefox (primary — bypasses Cloudflare) + Chromium as fallback
+RUN python -m playwright install firefox chromium --with-deps
 
 RUN python manage.py migrate --no-input
 

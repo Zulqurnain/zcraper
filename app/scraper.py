@@ -63,6 +63,11 @@ def _fetch_cloudscraper(url: str) -> Optional[str]:
 
 
 def _fetch_playwright(url: str) -> Optional[str]:
+    """
+    Headless Firefox bypasses Cloudflare's JS challenge automatically.
+    Falls back to Chromium if Firefox is not installed.
+    Passes --no-sandbox for VPS/Docker environments.
+    """
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -71,25 +76,37 @@ def _fetch_playwright(url: str) -> Optional[str]:
 
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=['--disable-blink-features=AutomationControlled', '--no-sandbox'],
-            )
+            # Firefox is less fingerprinted by Cloudflare than Chromium
+            try:
+                browser = p.firefox.launch(
+                    headless=True,
+                    firefox_user_prefs={
+                        'media.navigator.enabled': False,
+                        'privacy.resistFingerprinting': False,
+                    },
+                )
+                ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0'
+            except Exception:
+                logger.warning("Firefox not available, falling back to Chromium")
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-dev-shm-usage'],
+                )
+                ua = HEADERS['User-Agent']
+
             ctx = browser.new_context(
-                user_agent=HEADERS['User-Agent'],
+                user_agent=ua,
                 viewport={'width': 1280, 'height': 800},
                 locale='en-US',
                 extra_http_headers={'Accept-Language': 'en-US,en;q=0.9'},
-            )
-            ctx.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
             )
             page = ctx.new_page()
             try:
                 page.goto(url, wait_until='load', timeout=30000)
             except Exception:
                 pass
-            page.wait_for_timeout(2500)
+            # Wait for Cloudflare challenge to auto-resolve and redirect (up to 8s)
+            page.wait_for_timeout(8000)
             html = page.content()
             browser.close()
             return html
@@ -112,91 +129,153 @@ def _has_enough_text(html: str) -> bool:
 
 def extract_property_data(html: str, url: str) -> Dict:
     """Extract structured property data from raw HTML."""
+    import json as _json
     soup = BeautifulSoup(html, 'lxml')
 
-    # Title
-    title = ""
-    for sel in ['h1', 'meta[property="og:title"]', 'title']:
-        tag = soup.select_one(sel)
-        if tag:
-            title = tag.get('content', '') or tag.get_text(strip=True)
-            if title:
+    # ── JSON-LD structured data (most reliable source) ──────────────────
+    ld_data: Dict = {}
+    for script in soup.find_all('script', type='application/ld+json'):
+        try:
+            obj = _json.loads(script.string or '{}')
+            if isinstance(obj, list):
+                obj = next((o for o in obj if o.get('@type') in ('Residence', 'Product', 'Apartment', 'House', 'RealEstateListing')), {})
+            if obj.get('@type') and obj.get('@type') not in ('FAQPage', 'BreadcrumbList', 'WebPage', 'WebSite', 'Organization'):
+                ld_data = obj
                 break
+        except Exception:
+            continue
 
-    # Price — look for common currency patterns
+    # ── Title ────────────────────────────────────────────────────────────
+    title = (
+        ld_data.get('name')
+        or (soup.select_one('h1') and soup.select_one('h1').get_text(strip=True))
+        or (soup.select_one('meta[property="og:title"]') and soup.select_one('meta[property="og:title"]').get('content', ''))
+        or (soup.select_one('title') and soup.select_one('title').get_text(strip=True))
+        or 'Untitled Property'
+    )
+
+    # ── Price ────────────────────────────────────────────────────────────
+    # Search visible text only — not script tags
     price = ""
-    price_tag = soup.find(string=re.compile(r'RM\s?[\d,]+|USD\s?[\d,]+|\$[\d,]+'))
-    if price_tag:
-        price = price_tag.strip()
+    body_text = soup.body.get_text(' ', strip=True) if soup.body else ""
+    price_match = re.search(r'RM\s?[\d,]+(?:\s*/\s*mo(?:nth)?)?', body_text)
+    if not price_match:
+        price_match = re.search(r'USD\s?[\d,]+|\$[\d,]+', body_text)
+    if price_match:
+        price = price_match.group(0).strip()
 
-    # Description
-    desc = ""
-    for sel in ['.description', '#description', '[class*="description"]', 'meta[name="description"]']:
-        tag = soup.select_one(sel)
-        if tag:
-            desc = tag.get('content', '') or tag.get_text(separator=' ', strip=True)
-            if len(desc) > 30:
-                break
+    # ── Description ──────────────────────────────────────────────────────
+    desc = ld_data.get('description', '')
+    if not desc:
+        for sel in ['[class*="description"]', '#description', 'meta[name="description"]']:
+            tag = soup.select_one(sel)
+            if tag:
+                desc = tag.get('content', '') or tag.get_text(separator=' ', strip=True)
+                if len(desc) > 30:
+                    break
 
-    # Bedrooms / Bathrooms / Floor size — generic label search
-    bedrooms = _find_detail(soup, ['bed', 'bedroom', 'Bedroom'])
-    bathrooms = _find_detail(soup, ['bath', 'bathroom', 'Bathroom'])
-    floor_size = _find_detail(soup, ['sqft', 'sq ft', 'sq. ft', 'sqm', 'floor size', 'built-up'])
+    # ── Bedrooms / Bathrooms / Floor size ────────────────────────────────
+    # First try: regex patterns directly on the visible body text (most reliable)
+    body_text = soup.body.get_text(' ', strip=True) if soup.body else ""
 
-    # Location / address
+    m_bed = re.search(r'(\d{1,2})\s*bed(?:room)?s?', body_text, re.IGNORECASE)
+    bedrooms = m_bed.group(1) if m_bed else ""
+
+    m_bath = re.search(r'(\d{1,2})\s*bath(?:room)?s?', body_text, re.IGNORECASE)
+    bathrooms = m_bath.group(1) if m_bath else ""
+
+    m_size = re.search(r'([\d,]+)\s*(?:sq\.?\s?ft|sqft|sqm)', body_text, re.IGNORECASE)
+    floor_size = m_size.group(1) if m_size else ""
+
+    # Fallback: parse same patterns from description string
+    if not bedrooms:
+        m = re.search(r'(\d{1,2})\s*bedroom', desc, re.IGNORECASE)
+        if m:
+            bedrooms = m.group(1)
+    if not bathrooms:
+        m = re.search(r'(\d{1,2})\s*bathroom', desc, re.IGNORECASE)
+        if m:
+            bathrooms = m.group(1)
+    if not floor_size:
+        m = re.search(r'([\d,]+)\s*(?:sq\.?\s?ft|sqft|sqm)', desc, re.IGNORECASE)
+        if m:
+            floor_size = m.group(1)
+
+    # ── Location ─────────────────────────────────────────────────────────
     location = ""
-    for sel in ['[class*="address"]', '[class*="location"]', 'meta[property="og:locality"]']:
-        tag = soup.select_one(sel)
-        if tag:
-            location = tag.get('content', '') or tag.get_text(strip=True)
-            if location:
-                break
+    addr = ld_data.get('address', {})
+    if isinstance(addr, dict):
+        parts = [addr.get('streetAddress', ''), addr.get('addressLocality', ''), addr.get('addressRegion', '')]
+        location = ', '.join(p for p in parts if p)
+    if not location:
+        for sel in ['[class*="address"]', '[class*="location"]', 'meta[property="og:locality"]']:
+            tag = soup.select_one(sel)
+            if tag:
+                location = tag.get('content', '') or tag.get_text(strip=True)
+                if location:
+                    break
 
-    # Property type
-    property_type = ""
-    for sel in ['[class*="property-type"]', '[class*="listing-type"]']:
-        tag = soup.select_one(sel)
-        if tag:
-            property_type = tag.get_text(strip=True)
-            if property_type:
-                break
+    # ── Property type ────────────────────────────────────────────────────
+    property_type = ld_data.get('@type', '')
+    if not property_type:
+        for sel in ['[class*="property-type"]', '[class*="listing-type"]', '[class*="propertyType"]']:
+            tag = soup.select_one(sel)
+            if tag:
+                property_type = tag.get_text(strip=True)
+                if property_type:
+                    break
 
-    # Image URLs
+    # ── Images ───────────────────────────────────────────────────────────
     image_urls: List[str] = []
     base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
-    for img in soup.find_all('img'):
-        src = img.get('data-src') or img.get('src', '')
-        if src and not src.startswith('data:'):
-            image_urls.append(urljoin(base, src))
-    # Also grab og:image
+
     og_img = soup.select_one('meta[property="og:image"]')
     if og_img and og_img.get('content'):
-        image_urls.insert(0, og_img['content'])
+        image_urls.append(og_img['content'])
+
+    for img in soup.find_all('img'):
+        src = img.get('data-src') or img.get('data-lazy-src') or img.get('src', '')
+        if src and not src.startswith('data:') and not src.endswith('.svg'):
+            full = urljoin(base, src)
+            if urlparse(full).scheme in ('http', 'https'):
+                image_urls.append(full)
 
     return {
-        'title': title or 'Untitled Property',
+        'title': title,
         'price': price,
-        'description': desc,
+        'description': desc[:2000],
         'bedrooms': bedrooms,
         'bathrooms': bathrooms,
         'floor_size': floor_size,
         'location': location,
         'property_type': property_type,
         'source_url': url,
-        'image_urls': list(dict.fromkeys(image_urls))[:20],  # deduplicated, max 20
+        'image_urls': list(dict.fromkeys(image_urls))[:20],
     }
 
 
-def _find_detail(soup: BeautifulSoup, keywords: List[str]) -> str:
-    """Search nearby text for a numeric value next to a keyword."""
+def _find_detail_label(soup: BeautifulSoup, keywords: List[str]) -> str:
+    """
+    Find a numeric value associated with a label keyword.
+    Looks for a tag whose text IS the label and grabs the adjacent sibling/parent value.
+    """
     for kw in keywords:
-        tag = soup.find(string=re.compile(kw, re.IGNORECASE))
-        if tag:
-            parent = tag.parent
-            # Look for a number in the parent or sibling text
-            numbers = re.findall(r'[\d,]+(?:\.\d+)?', parent.get_text())
-            if numbers:
-                return numbers[0]
+        # Try finding a tag whose text matches the label
+        tag = soup.find(string=re.compile(rf'\b{re.escape(kw)}\b', re.IGNORECASE))
+        if not tag:
+            continue
+        parent = tag.parent
+        # Check sibling spans/divs for a number
+        for sibling in parent.find_next_siblings()[:3]:
+            nums = re.findall(r'\d[\d,]*(?:\.\d+)?', sibling.get_text())
+            if nums:
+                return nums[0]
+        # Check parent's parent children
+        for child in (parent.parent.children if parent.parent else []):
+            text = child.get_text(strip=True) if hasattr(child, 'get_text') else ''
+            nums = re.findall(r'\d[\d,]*(?:\.\d+)?', text)
+            if nums and text != parent.get_text(strip=True):
+                return nums[0]
     return ""
 
 
