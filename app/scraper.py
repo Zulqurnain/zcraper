@@ -54,19 +54,18 @@ def _render_page(url: str) -> Optional[str]:
     """
     Fetch page HTML for any URL.
     1. Try cloudscraper (fast, handles most Cloudflare JS challenges).
-    2. Fall back to Playwright (headless Firefox) for JS-heavy or protected pages.
-    Returns None if the page is still blocked after all attempts.
+    2. Fall back to Playwright Firefox with smart Cloudflare polling + 3 retries.
+    Returns None if still blocked after all attempts.
     """
     html = _fetch_cloudscraper(url)
-    if html and _has_enough_text(html):
+    if html and _is_real_page(html):
         return html
 
     logger.info(f"cloudscraper insufficient, switching to Playwright: {url}")
     html = _fetch_playwright(url)
 
-    # If Playwright still returned a Cloudflare challenge page, return None
-    if html and not _has_enough_text(html):
-        logger.warning(f"Cloudflare Managed Challenge could not be bypassed: {url}")
+    if not html:
+        logger.warning(f"All fetch attempts failed: {url}")
         return None
 
     return html
@@ -122,26 +121,53 @@ def _fetch_playwright(url: str) -> Optional[str]:
                 extra_http_headers={'Accept-Language': 'en-US,en;q=0.9'},
             )
             page = ctx.new_page()
-            try:
-                page.goto(url, wait_until='load', timeout=30000)
-            except Exception:
-                pass
-            # Allow up to 12s for Cloudflare challenge to auto-resolve
-            page.wait_for_timeout(12000)
+
+            for attempt in range(3):
+                try:
+                    page.goto(url, wait_until='load', timeout=30000)
+                except Exception:
+                    pass
+
+                # Wait for Cloudflare challenge to auto-resolve and redirect
+                # Poll every 2s for up to 20s instead of a blind sleep
+                for _ in range(10):
+                    page.wait_for_timeout(2000)
+                    html = page.content()
+                    title = page.title()
+                    # Real page reached — stop waiting
+                    if 'Just a moment' not in title and 'challenges.cloudflare.com' not in html:
+                        break
+                else:
+                    # Still on challenge page after 20s — retry full page load
+                    logger.warning(f"CF challenge still active after 20s (attempt {attempt + 1}/3): {url}")
+                    continue
+
+                # Got real content
+                browser.close()
+                return html
+
+            # All retries exhausted
             html = page.content()
             browser.close()
-            return html
+            return html if _is_real_page(html) else None
+
     except Exception as e:
         logger.error(f"Playwright failed ({url}): {e}")
         return None
 
 
-def _has_enough_text(html: str) -> bool:
-    if 'challenges.cloudflare.com' in html or 'Just a moment' in html[:500]:
+def _is_real_page(html: str) -> bool:
+    """True if html is a real page, not a Cloudflare challenge."""
+    if not html:
+        return False
+    if 'challenges.cloudflare.com' in html or 'Just a moment' in html[:1000]:
         return False
     soup = BeautifulSoup(html, 'lxml')
-    body_text = soup.body.get_text(strip=True) if soup.body else ""
-    return len(body_text) >= 200
+    return len(soup.body.get_text(strip=True) if soup.body else '') >= 200
+
+
+def _has_enough_text(html: str) -> bool:
+    return _is_real_page(html)
 
 
 # ------------------------------------------------------------------ #
