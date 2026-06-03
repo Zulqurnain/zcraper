@@ -87,13 +87,29 @@ def _fetch_cloudscraper(url: str) -> Optional[str]:
 def _fetch_playwright(url: str) -> Optional[str]:
     """
     Headless Firefox bypasses Cloudflare's JS challenge automatically.
-    Falls back to Chromium (with --no-sandbox for VPS/Docker) if Firefox unavailable.
+    Falls back to Chromium with full VPS/Docker-safe flags if Firefox unavailable.
+    All flags are safe for both local macOS and Linux VPS environments.
     """
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        logger.error("Playwright not installed — run: pip install playwright && playwright install firefox")
+        logger.error("Playwright not installed — run: pip install playwright && playwright install firefox chromium --with-deps")
         return None
+
+    # Full Chromium VPS-safe args
+    _CHROMIUM_ARGS = [
+        '--disable-blink-features=AutomationControlled',
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',   # avoids /dev/shm too small on VPS
+        '--disable-gpu',             # no GPU on VPS
+        '--disable-software-rasterizer',
+        '--disable-extensions',
+        '--no-first-run',
+        '--no-zygote',               # avoids process sandbox issues on Linux
+        '--single-process',          # safer on memory-limited VPS
+        '--ignore-certificate-errors',
+    ]
 
     try:
         with sync_playwright() as p:
@@ -103,15 +119,14 @@ def _fetch_playwright(url: str) -> Optional[str]:
                     firefox_user_prefs={
                         'media.navigator.enabled': False,
                         'privacy.resistFingerprinting': False,
+                        'browser.tabs.remote.autostart': False,  # disable multiprocess on VPS
                     },
                 )
                 ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0'
-            except Exception:
-                logger.warning("Firefox unavailable, falling back to Chromium")
-                browser = p.chromium.launch(
-                    headless=True,
-                    args=['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-dev-shm-usage'],
-                )
+                logger.debug("Using Firefox")
+            except Exception as e:
+                logger.warning(f"Firefox unavailable ({e}), falling back to Chromium")
+                browser = p.chromium.launch(headless=True, args=_CHROMIUM_ARGS)
                 ua = HEADERS['User-Agent']
 
             ctx = browser.new_context(

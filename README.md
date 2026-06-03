@@ -150,6 +150,17 @@ Second scrape →  apply cache   →  patch gaps        →  update (conf=1.00)
 
 ---
 
+## VPS Setup (Ubuntu/Debian)
+
+```bash
+git clone https://github.com/Zulqurnain/zcraper.git && cd zcraper
+bash setup_vps.sh        # installs all system deps, browsers, runs migrations
+source venv/bin/activate
+python run_server.py     # gRPC on :50051
+```
+
+`setup_vps.sh` installs all required Linux system libraries for headless Firefox and Chromium, generates a secure `DJANGO_SECRET_KEY`, and runs migrations automatically.
+
 ## Docker
 
 ```bash
