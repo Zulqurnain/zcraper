@@ -6,7 +6,7 @@ No external API keys. No third-party AI services. Fully self-sufficient.
 How it works
 ────────────
 1. After every successful scrape, learn() reverse-engineers which CSS selector
-   produced each field value and saves it to ScraperPattern (one DB row / domain).
+   produced each field value and saves it to zc_scraper_patterns (one PocketBase record / domain).
 2. On the next scrape of the same domain, enhance() applies those cached selectors
    instantly — sub-millisecond, zero network calls.
 3. Confidence score (0–1) grows with each successful scrape; patterns are only
@@ -37,22 +37,23 @@ class PatternAI:
         Fill empty fields in `data` using cached selectors for this domain.
         Called after the generic extraction cascade so it patches any gaps.
         """
-        from app.models import ScraperPattern
+        from app.pb_client import get_pattern
         domain = _domain(url)
         try:
-            pat = ScraperPattern.objects.get(domain=domain)
-        except ScraperPattern.DoesNotExist:
+            pat = get_pattern(domain)
+        except Exception:
             return data
 
-        if pat.confidence < 0.3:
+        if not pat or pat.get("confidence", 0) < 0.3:
             return data
 
-        for field, sel in (
-            ("title",       pat.title_sel),
-            ("price",       pat.price_sel),
-            ("description", pat.desc_sel),
-            ("location",    pat.location_sel),
+        for field, sel_key in (
+            ("title",       "title_sel"),
+            ("price",       "price_sel"),
+            ("description", "desc_sel"),
+            ("location",    "location_sel"),
         ):
+            sel = pat.get(sel_key, "")
             if not sel or data.get(field):
                 continue
             tag = soup.select_one(sel)
@@ -62,10 +63,10 @@ class PatternAI:
                     data[field] = val[:2000] if field == "description" else val[:500]
                     logger.debug(f"PatternAI [{domain}] patched '{field}' via '{sel}'")
 
-        if pat.image_sel and not data.get("images"):
+        if pat.get("image_sel") and not data.get("images"):
             imgs = [
                 t.get("src") or t.get("data-src") or ""
-                for t in soup.select(pat.image_sel)
+                for t in soup.select(pat["image_sel"])
             ]
             data["images"] = [i for i in imgs if i and not i.startswith("data:")][:50]
 
@@ -76,24 +77,27 @@ class PatternAI:
         Reverse-engineer and cache the CSS selectors that produced each field.
         Overwrites only when this scrape is equal or better than the last.
         """
-        from app.models import ScraperPattern
+        from app.pb_client import get_or_create_pattern, save_pattern
         domain = _domain(url)
         confidence = _confidence(data)
 
-        pat, _ = ScraperPattern.objects.get_or_create(domain=domain)
+        try:
+            pat, _ = get_or_create_pattern(domain)
 
-        if confidence >= pat.confidence:
-            discovered = self._discover(soup, data)
-            pat.title_sel    = discovered.get("title",       pat.title_sel)
-            pat.price_sel    = discovered.get("price",       pat.price_sel)
-            pat.desc_sel     = discovered.get("description", pat.desc_sel)
-            pat.location_sel = discovered.get("location",    pat.location_sel)
-            pat.image_sel    = discovered.get("images",      pat.image_sel)
-            pat.confidence   = max(confidence, pat.confidence)
+            if confidence >= pat.get("confidence", 0.0):
+                discovered = self._discover(soup, data)
+                pat["title_sel"]    = discovered.get("title",       pat.get("title_sel", ""))
+                pat["price_sel"]    = discovered.get("price",       pat.get("price_sel", ""))
+                pat["desc_sel"]     = discovered.get("description", pat.get("desc_sel", ""))
+                pat["location_sel"] = discovered.get("location",    pat.get("location_sel", ""))
+                pat["image_sel"]    = discovered.get("images",      pat.get("image_sel", ""))
+                pat["confidence"]   = max(confidence, pat.get("confidence", 0.0))
 
-        pat.scrape_count += 1
-        pat.save()
-        logger.info(f"PatternAI [{domain}] conf={pat.confidence:.2f} scrapes={pat.scrape_count}")
+            pat["scrape_count"] = pat.get("scrape_count", 0) + 1
+            save_pattern(pat)
+            logger.info(f"PatternAI [{domain}] conf={pat['confidence']:.2f} scrapes={pat['scrape_count']}")
+        except Exception as e:
+            logger.warning(f"PatternAI.learn failed for {domain}: {e}")
 
     # ------------------------------------------------------------------ #
     #  Pattern discovery                                                   #
@@ -158,15 +162,14 @@ def _css_selector(el: Tag) -> str:
         return f"#{el['id']}"
     classes = [c for c in (el.get("class") or []) if not re.search(r'\d{3,}|active|open|hover', c)]
     if classes:
-        return f"{el.name}.{classes[0]}"
-    if el.parent and el.parent.get("class"):
-        return f".{el.parent['class'][0]} > {el.name}"
+        return f"{el.name}.{'.'.join(classes[:2])}"
     return el.name
 
 
-def _image_selector(soup: BeautifulSoup, first_img_url: str) -> str:
+def _image_selector(soup: BeautifulSoup, img_url: str) -> str:
+    """Find the CSS selector for an img tag whose src matches img_url."""
     for img in soup.find_all("img"):
-        src = img.get("src") or img.get("data-src") or ""
-        if first_img_url in src or src in first_img_url:
-            return _css_selector(img)
+        for attr in ("src", "data-src", "data-lazy-src", "data-original"):
+            if img.get(attr) == img_url:
+                return _css_selector(img)
     return "img"

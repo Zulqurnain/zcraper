@@ -16,8 +16,12 @@ import cloudscraper
 from pathlib import Path
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
-from django.utils.text import slugify
-from django.conf import settings
+# slugify: simple regex implementation (no Django dependency)
+def slugify(text: str) -> str:
+    text = re.sub(r'[^\w\s-]', '', text.lower())
+    return re.sub(r'[-\s]+', '-', text).strip('-')
+
+MEDIA_ROOT = os.environ.get('MEDIA_ROOT', '/root/zcraper/media')
 from typing import Optional, Dict, List, Any
 
 logger = logging.getLogger(__name__)
@@ -533,7 +537,7 @@ def download_image(img_url: str, slug: str, source_url: str = '') -> Optional[st
             img_url = unquote(qs['url'])
             parsed = urlparse(img_url)
 
-        dest_dir = Path(settings.MEDIA_ROOT) / 'images' / slug
+        dest_dir = Path(MEDIA_ROOT) / 'images' / slug
         dest_dir.mkdir(parents=True, exist_ok=True)
 
         # Build a clean filename from the URL path
@@ -547,7 +551,7 @@ def download_image(img_url: str, slug: str, source_url: str = '') -> Optional[st
         dest = dest_dir / filename
 
         if dest.exists():
-            return str(dest.relative_to(settings.MEDIA_ROOT))
+            return str(dest.relative_to(Path(MEDIA_ROOT)))
 
         # Use site origin as Referer to bypass hotlink protection
         referer = (
@@ -568,7 +572,7 @@ def download_image(img_url: str, slug: str, source_url: str = '') -> Optional[st
             for chunk in r.iter_content(chunk_size=8192):
                 f.write(chunk)
 
-        return str(dest.relative_to(settings.MEDIA_ROOT))
+        return str(dest.relative_to(Path(MEDIA_ROOT)))
     except Exception as e:
         logger.warning(f"Image download failed ({img_url}): {e}")
         return None
@@ -580,11 +584,10 @@ def download_image(img_url: str, slug: str, source_url: str = '') -> Optional[st
 
 def scrape_and_create_draft(url: str):
     """
-    Scrape any URL and create a Post draft in the database.
+    Scrape any URL and create a Post draft in PocketBase (zc_posts collection).
     Returns (success: bool, message: str).
     """
-    from app.models import Post
-
+    from app.pb_client import slug_exists, create_post, update_post
     from app.pattern_ai import PatternAI
     ai = PatternAI()
 
@@ -597,15 +600,12 @@ def scrape_and_create_draft(url: str):
     if not data.get('title') or data['title'] == 'Untitled':
         return False, "Could not extract a title from the page"
 
-    # Map generic attributes → known Post fields where applicable
     attrs = data.get('attributes', {})
-    bedrooms     = _attr_value(attrs, ['bedroom', 'bed', 'bilik tidur'])
-    bathrooms    = _attr_value(attrs, ['bathroom', 'bath', 'bilik air'])
-    floor_size   = _attr_value(attrs, ['floor size', 'built-up', 'land area', 'size', 'sqft', 'sqm'])
+    bedrooms      = _attr_value(attrs, ['bedroom', 'bed', 'bilik tidur'])
+    bathrooms     = _attr_value(attrs, ['bathroom', 'bath', 'bilik air'])
+    floor_size    = _attr_value(attrs, ['floor size', 'built-up', 'land area', 'size', 'sqft', 'sqm'])
     property_type = _attr_value(attrs, ['property type', 'type', 'listing type', 'category'])
 
-    # Fallback: parse from body text for common patterns
-    body = html  # raw html used for regex fallbacks
     if not bedrooms:
         m = re.search(r'(\d{1,2})\s*bed(?:room)?s?', data['description'], re.IGNORECASE)
         bedrooms = m.group(1) if m else ""
@@ -616,31 +616,30 @@ def scrape_and_create_draft(url: str):
         m = re.search(r'([\d,]+)\s*(?:sq\.?\s?ft|sqft|sqm)', data['description'], re.IGNORECASE)
         floor_size = m.group(1) if m else ""
 
-    # Build a unique slug
     base_slug = slugify(data['title'])[:200] or 'page'
     slug = base_slug
     counter = 1
-    while Post.objects.filter(slug=slug).exists():
+    while slug_exists(slug):
         slug = f"{base_slug}-{counter}"
         counter += 1
 
-    post = Post.objects.create(
-        title=data['title'],
-        slug=slug,
-        source_url=data['source_url'],
-        price=data['price'],
-        description=data['description'],
-        bedrooms=bedrooms,
-        bathrooms=bathrooms,
-        floor_size=floor_size,
-        location=data['location'],
-        property_type=property_type or data['category'],
-        raw_data=data['attributes'],
-        image_urls=data['images'],
-        status=Post.STATUS_DRAFT,
-    )
+    post = create_post({
+        "title":            data['title'],
+        "slug":             slug,
+        "source_url":       data['source_url'],
+        "price":            data['price'],
+        "description":      data['description'],
+        "bedrooms":         bedrooms,
+        "bathrooms":        bathrooms,
+        "floor_size":       floor_size,
+        "location":         data['location'],
+        "property_type":    property_type or data['category'],
+        "raw_data":         data['attributes'],
+        "image_urls":       data['images'],
+        "downloaded_images": [],
+        "status":           "draft",
+    })
 
-    # Download images to disk
     downloaded: List[str] = []
     for img_url in data['images']:
         path = download_image(img_url, slug, source_url=url)
@@ -648,15 +647,13 @@ def scrape_and_create_draft(url: str):
             downloaded.append(path)
 
     if downloaded:
-        post.downloaded_images = downloaded
-        post.save(update_fields=['downloaded_images'])
+        update_post(post["id"], {"downloaded_images": downloaded})
 
-    # PatternAI: learn selectors from this successful scrape
     soup = BeautifulSoup(html, 'lxml')
     ai.learn(url, soup, data)
 
     return True, (
-        f"Draft created: '{post.title}' (id={post.pk}) — "
+        f"Draft created: '{post['title']}' (id={post['id']}) — "
         f"{len(data['images'])} images found, {len(downloaded)} downloaded"
     )
 
