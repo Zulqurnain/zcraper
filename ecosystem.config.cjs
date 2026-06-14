@@ -8,6 +8,7 @@ module.exports = {
     instances: 1,
     uid: "webapp",
     gid: "webapp",
-    env: { HOME: "/home/webapp", PLAYWRIGHT_BROWSERS_PATH: "/opt/ms-playwright", PORT: "5500", PB_ADMIN_EMAIL: "zulqurnainapps@gmail.com", PB_ADMIN_PASSWORD: "***REMOVED-SEE-INCIDENT-2026-06-14***" }
+    // PB credentials are loaded from .env by pb_client.py — do NOT add them here
+    env: { HOME: "/home/webapp", PLAYWRIGHT_BROWSERS_PATH: "/opt/ms-playwright", PORT: "5500" }
   }]
 };

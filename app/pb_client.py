@@ -7,6 +7,22 @@ import time
 import httpx
 import logging
 
+import pathlib as _pl
+
+def _load_dotenv():
+    """Load .env from the project root without requiring python-dotenv."""
+    env_path = _pl.Path(__file__).resolve().parent.parent / '.env'
+    if not env_path.exists():
+        return
+    for _line in env_path.read_text().splitlines():
+        _line = _line.strip()
+        if not _line or _line.startswith('#') or '=' not in _line:
+            continue
+        _k, _, _v = _line.partition('=')
+        os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
+
+_load_dotenv()
+
 logger = logging.getLogger(__name__)
 
 PB_URL = os.environ.get("PB_URL", "http://127.0.0.1:8090")
